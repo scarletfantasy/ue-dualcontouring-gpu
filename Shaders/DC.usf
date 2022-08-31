@@ -1,0 +1,348 @@
+//Since we can't #include private Engine shaders such as Common.ush we have to copy the needed Shaders from the Engine' Shader directory.
+//When this gets chaned in the future, we could change this to #include "/Engine/Private/Common.ush".
+#include "/Engine/Private/Common.ush"
+
+//--------------------------------------------------------------------------------------
+// Buffers
+//--------------------------------------------------------------------------------------
+RWStructuredBuffer<float3> meshpoints;         // Point Positions Input Buffer
+RWStructuredBuffer<float3> meshnormals; 
+RWStructuredBuffer<int> meshcorners; 
+RWStructuredBuffer<int> debugint;
+
+int gridsize;
+float3 boxpos;
+float boxscale;
+float3 spherepos;
+float spherescale;
+
+
+#define HIGHEST_RESOLUTION 64
+#define SVD_NUM_SWEEPS 4
+#define COUNT 5
+#define PSUEDO_INVERSE_THRESHOLD 1e-6f
+
+typedef float mat3x3[3][3];
+typedef float mat3x3_tri[6];
+
+float sdSphere( float3 p, float s )
+{
+  return length(p)-s;
+}
+float sdBox( float3 p, float3 b )
+{
+  float3 q = abs(p) - b;
+  return length(max(q,float3(0.0,0.0,0.0))) + min(max(q.x,max(q.y,q.z)),0.0);
+}
+float densityfunc(float3 pos)
+{
+	//return sdSphere(pos-float3(16.0,16.0,16.0),8.0);
+	//return sdBox(pos-float3(10.0,10.0,10.0),float3(4.0,4.0,4.0));
+    return min(sdSphere(pos-spherepos,8.0*spherescale),sdBox(pos-boxpos,float3(4.0,4.0,4.0)*boxscale));
+}
+static int2 edgevmap[12] =
+{
+	int2(0,4), int2(1,5), int2(2,6), int2(3,7),
+	int2(0,2), int2(1,3), int2(4,6), int2(5,7),
+	int2(0,1), int2(2,3), int2(4,5), int2(6,7)
+};
+
+static float3 CHILD_MIN_OFFSETS[8] =
+{
+	float3(0, 0, 0),
+	float3(0, 0, 1),
+	float3(0, 1, 0),
+	float3(0, 1, 1),
+	float3(1, 0, 0),
+	float3(1, 0, 1),
+	float3(1, 1, 0),
+	float3(1, 1, 1)
+};
+
+// SVD
+/////////////////////////////////////////////////
+
+void svd_mul_matrix_vec(inout float4 result, mat3x3 a, float4 b)
+{
+	result.x = dot(float4(a[0][0], a[0][1], a[0][2], 0.0f), b);
+	result.y = dot(float4(a[1][0], a[1][1], a[1][2], 0.0f), b);
+	result.z = dot(float4(a[2][0], a[2][1], a[2][2], 0.0f), b);
+	result.w = 0.0f;
+}
+
+void givens_coeffs_sym(float a_pp, float a_pq, float a_qq, inout float c, inout float s)
+{
+	if (a_pq == 0.0f)
+	{
+		c = 1.0f;
+		s = 0.0f;
+		return;
+	}
+	
+	float tau = (a_qq - a_pp) / (2.0f * a_pq);
+	float stt = sqrt(1.0f + tau * tau);
+	float tan = 1.0f / ((tau >= 0.0f) ? (tau + stt) : (tau - stt));
+	c = rsqrt(1.0f + tan * tan);
+	s = tan * c;
+}
+
+void svd_rotate_xy(inout float x, inout float y, float c, float s)
+{
+	float u = x; float v = y;
+	x = c * u - s * v;
+	y = s * u + c * v;
+}
+
+void svd_rotateq_xy(inout float x, inout float y, inout float a, float c, float s)
+{
+	float cc = c * c; float ss = s * s;
+	float mx = 2.0f * c * s * a;
+	float u = x; float v = y;
+	x = cc * u - mx + ss * v;
+	y = ss * u + mx + cc * v;
+}
+
+void svd_rotate(inout mat3x3 vtav, mat3x3 v, int a, int b)
+{
+	if (vtav[a][b] == 0.0f) return;
+	
+	float c, s;
+	givens_coeffs_sym(vtav[a][a], vtav[a][b], vtav[b][b], c, s);
+	
+	float x, y, z;
+	x = vtav[a][a]; y = vtav[b][b]; z = vtav[a][b];
+	svd_rotateq_xy(x, y, z, c, s);
+	vtav[a][a] = x; vtav[b][b] = y; vtav[a][b] = z;
+	
+	x = vtav[0][3-b]; y = vtav[1-a][2];
+	svd_rotate_xy(x, y, c, s);
+	vtav[0][3-b] = x; vtav[1-a][2] = y;
+	
+	vtav[a][b] = 0.0f;
+	
+	x = v[0][a]; y = v[0][b];
+	svd_rotate_xy(x, y, c, s);
+	v[0][a] = x; v[0][b] = y;
+	
+	x = v[1][a]; y = v[1][b];
+	svd_rotate_xy(x, y, c, s);
+	v[1][a] = x; v[1][b] = y;
+	
+	x = v[2][a]; y = v[2][b];
+	svd_rotate_xy(x, y, c, s);
+	v[2][a] = x; v[2][b] = y;
+}
+
+void svd_solve_sym(inout mat3x3_tri a, inout float4 sigma, mat3x3 v)
+{
+	mat3x3 vtav = { { 0.0f, 0.0f, 0.0f }, { 0.0f, 0.0f, 0.0f }, { 0.0f, 0.0f, 0.0f } };
+	vtav[0][0] = a[0]; vtav[0][1] = a[1]; vtav[0][2] = a[2];
+	vtav[1][0] = 0.0f;  vtav[1][1] = a[3]; vtav[1][2] = a[4];
+	vtav[2][0] = 0.0f;  vtav[2][1] = 0.0f;  vtav[2][2] = a[5];
+	
+	for (int i = 0; i < SVD_NUM_SWEEPS; ++i)
+	{
+		svd_rotate(vtav, v, 0, 1);
+		svd_rotate(vtav, v, 0, 2);
+		svd_rotate(vtav, v, 1, 2);
+	}
+	
+	sigma = float4(vtav[0][0], vtav[1][1], vtav[2][2], 0.0f);
+}
+
+float svd_invdet(float x, float tol)
+{
+	return (abs(x) < tol || abs(1.0f / x) < tol) ? 0.0f : (1.0f / x);
+}
+
+void svd_pseudoinverse(inout mat3x3 o, float4 sigma, mat3x3 v)
+{
+	float d0 = svd_invdet(sigma.x, PSUEDO_INVERSE_THRESHOLD);
+	float d1 = svd_invdet(sigma.y, PSUEDO_INVERSE_THRESHOLD);
+	float d2 = svd_invdet(sigma.z, PSUEDO_INVERSE_THRESHOLD);
+
+	o[0][0] = v[0][0] * d0 * v[0][0] + v[0][1] * d1 * v[0][1] + v[0][2] * d2 * v[0][2];
+	o[0][1] = v[0][0] * d0 * v[1][0] + v[0][1] * d1 * v[1][1] + v[0][2] * d2 * v[1][2];
+	o[0][2] = v[0][0] * d0 * v[2][0] + v[0][1] * d1 * v[2][1] + v[0][2] * d2 * v[2][2];
+	o[1][0] = v[1][0] * d0 * v[0][0] + v[1][1] * d1 * v[0][1] + v[1][2] * d2 * v[0][2];
+	o[1][1] = v[1][0] * d0 * v[1][0] + v[1][1] * d1 * v[1][1] + v[1][2] * d2 * v[1][2];
+	o[1][2] = v[1][0] * d0 * v[2][0] + v[1][1] * d1 * v[2][1] + v[1][2] * d2 * v[2][2];
+	o[2][0] = v[2][0] * d0 * v[0][0] + v[2][1] * d1 * v[0][1] + v[2][2] * d2 * v[0][2];
+	o[2][1] = v[2][0] * d0 * v[1][0] + v[2][1] * d1 * v[1][1] + v[2][2] * d2 * v[1][2];
+	o[2][2] = v[2][0] * d0 * v[2][0] + v[2][1] * d1 * v[2][1] + v[2][2] * d2 * v[2][2];
+}
+
+void svd_solve_ATA_Atb(inout mat3x3_tri ATA, float4 Atb, inout float4 x)
+{
+	mat3x3 V = { { 1.0f, 0.0f, 0.0f }, { 0.0f, 1.0f, 0.0f }, { 0.0f, 0.0f, 1.0f } };
+	
+	float4 sigma = float4(0, 0, 0, 0);
+	svd_solve_sym(ATA, sigma, V);
+	
+	mat3x3 Vinv = { { 0.0f, 0.0f, 0.0f }, { 0.0f, 0.0f, 0.0f }, { 0.0f, 0.0f, 0.0f } };
+	svd_pseudoinverse(Vinv, sigma, V);
+	svd_mul_matrix_vec(x, Vinv, Atb);
+}
+
+void svd_vmul_sym(inout float4 result, mat3x3_tri A, float4 v)
+{
+	float4 A_row_x = float4(A[0], A[1], A[2], 0);
+	result.x = dot(A_row_x, v);
+	result.y = A[1] * v.x + A[3] * v.y + A[4] * v.z;
+	result.z = A[2] * v.x + A[4] * v.y + A[5] * v.z;
+}
+
+// QEF
+/////////////////////////////////////////////////
+
+void qef_add(float4 n, float4 p, inout mat3x3_tri ATA, inout float4 Atb, inout float4 pointaccum, inout float btb)
+{
+	ATA[0] += n.x * n.x;
+	ATA[1] += n.x * n.y;
+	ATA[2] += n.x * n.z;
+	ATA[3] += n.y * n.y;
+	ATA[4] += n.y * n.z;
+	ATA[5] += n.z * n.z;
+	
+	float b = dot(p, n);
+	Atb.x += n.x * b;
+	Atb.y += n.y * b;
+	Atb.z += n.z * b;
+	btb += b * b;
+	
+	pointaccum.x += p.x;
+	pointaccum.y += p.y;
+	pointaccum.z += p.z;
+	pointaccum.w += 1.0f;
+}
+
+float qef_calc_error(mat3x3_tri A, float4 x, float4 b)
+{
+	float4 tmp = float4(0, 0, 0, 0);
+	svd_vmul_sym(tmp, A, x);
+	tmp = b - tmp;
+	
+	return dot(tmp, tmp);
+}
+
+float qef_solve(mat3x3_tri ATA, float4 Atb, float4 pointaccum, inout float4 x)
+{
+	float4 masspoint = pointaccum / pointaccum.w;
+	
+	float4 A_mp = float4(0, 0, 0, 0);
+	svd_vmul_sym(A_mp, ATA, masspoint);
+	A_mp = Atb - A_mp;
+	
+	svd_solve_ATA_Atb(ATA, A_mp, x);
+	
+	float error = qef_calc_error(ATA, x, Atb);
+	x += masspoint;
+	
+	return error;
+}
+
+static float3 ApproximateZeroCrossingPosition(float3 p0, float3 p1)
+{
+	float minValue = 100000.0f;
+	float t = 0.0f;
+	float currentT = 0.0f;
+	float steps = 8;
+	float increment = 1.0f / steps;
+	while (currentT <= 1.0f)
+	{
+		float3 p = p0 + ((p1 - p0) * currentT);
+		float density = abs(densityfunc(p));
+		if (density < minValue)
+		{
+			minValue = density;
+			t = currentT;
+		}
+
+		currentT += increment;
+	}
+
+	return p0 + ((p1 - p0) * t);
+}
+
+static float3 CalculateSurfaceNormal(float3 p)
+{
+	float H = 0.001f;
+	float dx = densityfunc(p + float3(H, 0.0f, 0.0f)) - densityfunc(p - float3(H, 0.0f, 0.0f));
+	float dy = densityfunc(p + float3(0.0f, H, 0.0f)) - densityfunc(p - float3(0.0f, H, 0.0f));
+	float dz = densityfunc(p + float3(0.0f, 0.0f, H)) - densityfunc(p - float3(0.0f, 0.0f, H));
+
+	return normalize(float3(dx, dy, dz));
+}
+int coord2ind(int3 coord)
+{
+	return coord.x*gridsize*gridsize+coord.y*gridsize+coord.z;
+}
+[numthreads(4,4,4)]
+void MainComputeShader(uint3 id : SV_DispatchThreadID)
+{
+    
+    
+	int corners=0;
+	
+    for (int i = 0; i < 8; i++)
+	{
+		float3 pos = float3(id.xyz) + CHILD_MIN_OFFSETS[i];
+		float dens=densityfunc(pos);
+		int material = dens < 0.f ? 1 : 0;
+		corners |= (material << i);
+	}
+
+	int MAX_CROSSINGS = 6;
+	int edgeCount = 0;
+	debugint[coord2ind(id.xyz)]=corners;
+	float4 pointaccum = float4(0, 0, 0, 0);
+	mat3x3_tri ATA = { 0, 0, 0, 0, 0, 0 };
+	float4 Atb = float4(0, 0, 0, 0);
+	float3 averageNormal = float3(0, 0, 0);
+	float btb = 0;
+	float3 nodePos=float3(id.xyz);
+	for (int j = 0; j < 12 && edgeCount <= MAX_CROSSINGS; j++)
+	{
+		int c1 = edgevmap[j].x;
+		int c2 = edgevmap[j].y;
+
+		int m1 = (corners >> c1) & 1;
+		int m2 = (corners >> c2) & 1;
+			
+		if (!((m1 == 0 && m2 == 0) || (m1 == 1 && m2 == 1)))
+		{
+			float3 p1 = nodePos + (CHILD_MIN_OFFSETS[c1] );
+			float3 p2 = nodePos + (CHILD_MIN_OFFSETS[c2] );
+			float3 p = ApproximateZeroCrossingPosition(p1, p2);
+			float3 n = CalculateSurfaceNormal(p);
+				
+			qef_add(float4(n.x, n.y, n.z, 0), float4(p.x, p.y, p.z, 0), ATA, Atb, pointaccum, btb);
+				
+			averageNormal += n;
+			
+			edgeCount++;
+		}
+	}
+	averageNormal = normalize(averageNormal / edgeCount);
+	float3 com = float3(pointaccum.x, pointaccum.y, pointaccum.z) / pointaccum.w;
+	float4 solved_position = float4(0, 0, 0, 0);
+	float error = qef_solve(ATA, Atb, pointaccum, solved_position);
+			
+	float3 Min = nodePos;
+	float3 Max = nodePos + float3(1.0f, 1.0f, 1.0f);
+	if (solved_position.x < Min.x || solved_position.x > Max.x ||
+		solved_position.y < Min.y || solved_position.y > Max.y ||
+		solved_position.z < Min.z || solved_position.z > Max.z)
+	{
+		solved_position.x = com.x;
+		solved_position.y = com.y;
+		solved_position.z = com.z;
+	}
+	int curind=coord2ind(id.xyz);
+	meshpoints[curind]=solved_position.xyz;
+	meshnormals[curind]=averageNormal;
+	meshcorners[curind]=corners;
+	//meshpoints[coord2ind(id.xyz)]=float3(0.0,1.0,2.0);
+	
+	
+}
